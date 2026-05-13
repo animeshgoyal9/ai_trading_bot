@@ -741,9 +741,15 @@ def _ai_result_card(symbol: str, result: dict, show_full: bool = False):
     risk     = result.get("risk_level", "—")
     reason   = result.get("reasoning", "")
     factors  = result.get("key_factors", [])
-    sl       = result.get("stop_loss_recommendation")
-    tp       = result.get("take_profit_recommendation")
-    entry    = result.get("entry_price_recommendation")
+    def _to_float(v):
+        try:
+            return float(v) if v is not None else None
+        except (ValueError, TypeError):
+            return None
+
+    sl    = _to_float(result.get("stop_loss_recommendation"))
+    tp    = _to_float(result.get("take_profit_recommendation"))
+    entry = _to_float(result.get("entry_price_recommendation"))
 
     color    = _AI_ACTION_COLOR.get(action, "#8b949e")
     border   = f"2px solid {color}"

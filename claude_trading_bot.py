@@ -49,6 +49,7 @@ class ClaudeTradingBot:
 
         self.positions = {}
         self.orders = {}
+        self.recently_sold = {}   # {symbol: datetime} — cooldown after selling
 
     def is_market_open(self):
         """Check if market is open for trading (regular or extended hours)."""
@@ -511,6 +512,7 @@ class ClaudeTradingBot:
 
                                 # Sell position
                                 self.place_order(symbol, position['shares'], side='sell')
+                                self.recently_sold[symbol] = datetime.now()  # start cooldown
                                 logger.info(f"✅ SELL {position['shares']} shares of {symbol} @ ${current_price:.2f}")
                                 logger.info(f"   Claude's confidence: {decision['confidence']:.0%}")
                                 send_trade_alert(symbol, 'sell', current_price,
@@ -525,6 +527,7 @@ class ClaudeTradingBot:
                             )
                             if should_exit and decision['action'] != 'sell':
                                 logger.warning(f"⚠️  Risk Manager Override: {reason}")
+                                self.recently_sold[symbol] = datetime.now()  # start cooldown
                                 self.place_order(symbol, position['shares'], side='sell')
                                 logger.info(f"✅ SELL {symbol} (Risk Management Override)")
                                 send_trade_alert(symbol, 'sell', current_price, 1.0,
@@ -533,6 +536,16 @@ class ClaudeTradingBot:
 
 
                         else:
+                            # Check cooldown — skip if sold within last 24 hours
+                            cooldown_hours = 24
+                            if symbol in self.recently_sold:
+                                hours_since_sell = (datetime.now() - self.recently_sold[symbol]).total_seconds() / 3600
+                                if hours_since_sell < cooldown_hours:
+                                    logger.info(f"⏳ {symbol} in cooldown ({hours_since_sell:.1f}h / {cooldown_hours}h since last sell) — skipping")
+                                    continue
+                                else:
+                                    del self.recently_sold[symbol]  # cooldown expired
+
                             # Ask Claude if we should buy
                             logger.info("Asking Claude for analysis...")
                             decision = self.analyze_with_claude(symbol, df)
