@@ -13,10 +13,15 @@ urllib3==1.26.20
 # Data
 yfinance==0.2.51
 python-dateutil==2.9.0
+lxml>=4.9.0         # required by catalyst_scanner RSS + HTML parsing
 
 # Technical indicators
 ta==0.11.0
-# pandas-ta installed separately
+
+# AI agents
+mistralai>=1.0.0
+anthropic>=0.40.0
+google-generativeai>=0.8.0
 
 # Utilities
 python-dotenv==1.0.1
@@ -27,10 +32,6 @@ loguru==0.7.2
 # Visualization
 matplotlib==3.8.4
 seaborn==0.13.2
-
-# AI
-anthropic>=0.40.0
-google-generativeai>=0.8.0
 
 # Other
 textblob==0.17.1
