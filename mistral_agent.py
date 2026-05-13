@@ -16,8 +16,9 @@ import config
 
 # ── yfinance cache + throttle ─────────────────────────────────────────────────
 _earnings_cache  = {}   # symbol → earnings dict
-_enhanced_cache  = {}   # symbol → options/fundamentals dict
+_enhanced_cache  = {}   # symbol → {data: dict, ts: float}
 _last_yf_call    = 0.0  # timestamp of last yfinance call
+_ENHANCED_TTL    = 6 * 3600  # refresh options/fundamentals every 6 hours
 
 
 def _yf_throttle():
@@ -36,10 +37,12 @@ def get_enhanced_context(symbol: str) -> dict:
     Returns a dict with keys like analyst_upside, pc_ratio, inst_buyer, pos52, etc.
     Results are cached per session to avoid redundant API calls.
     """
+    import time
     if '/' in symbol:   # crypto — no options/analyst data
         return {}
-    if symbol in _enhanced_cache:
-        return _enhanced_cache[symbol]
+    cached = _enhanced_cache.get(symbol)
+    if cached and (time.time() - cached['ts']) < _ENHANCED_TTL:
+        return cached['data']
 
     ctx = {}
     try:
@@ -126,7 +129,8 @@ def get_enhanced_context(symbol: str) -> dict:
     except Exception as e:
         logger.debug(f"[enhanced] context fetch failed for {symbol}: {e}")
 
-    _enhanced_cache[symbol] = ctx
+    import time
+    _enhanced_cache[symbol] = {'data': ctx, 'ts': time.time()}
     return ctx
 
 def get_earnings_context(symbol: str) -> dict:
