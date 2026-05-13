@@ -14,9 +14,120 @@ from dotenv import load_dotenv
 load_dotenv()
 import config
 
-# ── Earnings helper (yfinance) ────────────────────────────────────────────────
-_earnings_cache = {}   # symbol → dict
-_last_yf_call   = 0.0  # timestamp of last yfinance call
+# ── yfinance cache + throttle ─────────────────────────────────────────────────
+_earnings_cache  = {}   # symbol → earnings dict
+_enhanced_cache  = {}   # symbol → options/fundamentals dict
+_last_yf_call    = 0.0  # timestamp of last yfinance call
+
+
+def _yf_throttle():
+    """Ensure at least 2s between yfinance calls."""
+    import time
+    global _last_yf_call
+    gap = time.time() - _last_yf_call
+    if gap < 2.0:
+        time.sleep(2.0 - gap)
+    _last_yf_call = time.time()
+
+
+def get_enhanced_context(symbol: str) -> dict:
+    """
+    Fetch options flow, analyst targets, and fundamentals for a symbol.
+    Returns a dict with keys like analyst_upside, pc_ratio, inst_buyer, pos52, etc.
+    Results are cached per session to avoid redundant API calls.
+    """
+    if '/' in symbol:   # crypto — no options/analyst data
+        return {}
+    if symbol in _enhanced_cache:
+        return _enhanced_cache[symbol]
+
+    ctx = {}
+    try:
+        import yfinance as yf
+        _yf_throttle()
+        ticker = yf.Ticker(symbol)
+        info   = ticker.info or {}
+
+        price = info.get('currentPrice') or info.get('regularMarketPrice', 0)
+
+        # ── Analyst price target ──────────────────────────────────────────
+        target = info.get('targetMeanPrice', 0)
+        if price and target:
+            ctx['analyst_upside'] = round((target / price - 1) * 100, 1)
+            ctx['analyst_target'] = round(target, 2)
+            ctx['analyst_count']  = info.get('numberOfAnalystOpinions', 0)
+
+        # ── 52-week position ──────────────────────────────────────────────
+        w52h = info.get('fiftyTwoWeekHigh', 0)
+        w52l = info.get('fiftyTwoWeekLow', 0)
+        if price and w52h and w52l and w52h > w52l:
+            ctx['pos52']   = round((price - w52l) / (w52h - w52l) * 100, 1)
+            ctx['week52h'] = w52h
+            ctx['week52l'] = w52l
+
+        # ── Fundamentals ──────────────────────────────────────────────────
+        fpe        = info.get('forwardPE')
+        peg        = info.get('trailingPegRatio') or info.get('pegRatio')
+        rev_growth = info.get('revenueGrowth')
+        op_margins = info.get('operatingMargins')
+        if fpe:        ctx['forward_pe']  = round(float(fpe), 1)
+        if peg:        ctx['peg']         = round(float(peg), 2)
+        if rev_growth: ctx['rev_growth']  = round(float(rev_growth) * 100, 1)
+        if op_margins: ctx['op_margins']  = round(float(op_margins) * 100, 1)
+
+        # ── Options flow ──────────────────────────────────────────────────
+        try:
+            _yf_throttle()
+            exps = ticker.options
+            if exps:
+                chain    = ticker.option_chain(exps[0])
+                calls_df = chain.calls.copy()
+                puts_df  = chain.puts.copy()
+                c_vol    = float(calls_df['volume'].fillna(0).sum())
+                p_vol    = float(puts_df['volume'].fillna(0).sum())
+
+                if p_vol > 0:
+                    ctx['pc_ratio']  = round(c_vol / p_vol, 2)
+                    ctx['call_vol']  = int(c_vol)
+                    ctx['put_vol']   = int(p_vol)
+                    if c_vol / p_vol < 0.7:
+                        ctx['options_sentiment'] = 'Bearish (heavy put buying)'
+                    elif c_vol / p_vol > 1.5:
+                        ctx['options_sentiment'] = 'Bullish (heavy call buying)'
+                    else:
+                        ctx['options_sentiment'] = 'Neutral'
+
+                # Institutional flow (same 4-signal proxy as dashboard)
+                if c_vol > 200 and price:
+                    signals = []
+                    vol_by_strike = calls_df.groupby('strike')['volume'].sum().fillna(0)
+                    total_c = float(vol_by_strike.sum())
+                    if total_c > 0:
+                        hhi = float(((vol_by_strike / total_c) ** 2).sum())
+                        signals.append(min(100, hhi * 200))
+                    deep_mask = calls_df['strike'] < price * 0.80
+                    deep_vol  = float(calls_df.loc[deep_mask, 'volume'].fillna(0).sum())
+                    signals.append(min(100, (deep_vol / c_vol) * 300))
+                    max_block = float(calls_df['volume'].fillna(0).max())
+                    signals.append(min(100, max_block / 20))
+                    if total_c > 0:
+                        top5_pct = float(vol_by_strike.nlargest(5).sum()) / total_c
+                        signals.append(min(100, max(0, (top5_pct - 0.35) * 250)))
+                    inst_conf = round(sum(signals) / len(signals))
+                    ctx['inst_conf']  = inst_conf
+                    ctx['inst_buyer'] = (
+                        'Institutional' if inst_conf >= 55 else
+                        'Mixed'         if inst_conf >= 30 else
+                        'Retail'
+                    )
+        except Exception as _oe:
+            logger.debug(f"[enhanced] options fetch failed for {symbol}: {_oe}")
+
+    except Exception as e:
+        logger.debug(f"[enhanced] context fetch failed for {symbol}: {e}")
+
+    _enhanced_cache[symbol] = ctx
+    return ctx
 
 def get_earnings_context(symbol: str) -> dict:
     """Return a dict with upcoming earnings date, last surprise %, and beat streak.
@@ -108,21 +219,30 @@ class MistralTrader:
     def analyze_and_decide(self, symbol, technical_data, market_context=None,
                            news_context=None, current_position=None):
         try:
-            earnings_ctx = get_earnings_context(symbol)
+            earnings_ctx  = get_earnings_context(symbol)
+            enhanced_ctx  = get_enhanced_context(symbol)
             prompt = self._build_prompt(symbol, technical_data, market_context,
-                                        current_position, earnings_ctx)
+                                        current_position, earnings_ctx, enhanced_ctx)
             logger.info(f"Asking Mistral to analyze {symbol}...")
 
-            response = self.client.chat.complete(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": self._get_system_prompt()},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.1,
-                max_tokens=1000,
-                timeout_ms=30000,   # 30-second timeout — never hang indefinitely
-            )
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+            def _call():
+                return self.client.chat.complete(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": self._get_system_prompt()},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=1000,
+                )
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(_call)
+                try:
+                    response = future.result(timeout=45)   # hard 45-second wall-clock timeout
+                except FuturesTimeout:
+                    future.cancel()
+                    raise Exception("Mistral API timed out after 45 seconds")
 
             decision = self._parse_decision(response.choices[0].message.content)
             logger.info(f"Mistral's decision for {symbol}: {decision['action']} "
@@ -142,16 +262,33 @@ class MistralTrader:
         return """You are an aggressive quantitative trader with 20+ years of experience.
 Your goal is to maximize returns by actively trading opportunities.
 
-Trading rules:
+Trading rules — TECHNICALS:
 - BUY on any bullish signal — oversold RSI, MACD crossover, strong momentum, or dip in an uptrend
 - BUY during pullbacks and dips even in volatile conditions — these are opportunities
 - SELL to lock in profits or cut losses quickly — don't let winners turn into losers
 - HOLD only when there is absolutely no clear signal either way
 - Favor action over inaction — missing a trade is worse than a small loss
 - Volatility is your friend — high ATR stocks have bigger profit potential
-- EARNINGS: If a stock has 3+ consecutive earnings beats, lean bullish — serial outperformers keep outperforming
-- EARNINGS: If earnings is within 14 days and the stock is a serial beater, factor in pre-earnings drift (stocks often run up before a beat)
-- EARNINGS: If a stock has 2+ consecutive misses, be cautious — reduce confidence on buy signals
+
+Trading rules — EARNINGS:
+- If a stock has 3+ consecutive earnings beats, lean bullish — serial outperformers keep outperforming
+- If earnings is within 14 days and the stock is a serial beater, factor in pre-earnings drift
+- If a stock has 2+ consecutive misses, be cautious — reduce confidence on buy signals
+
+Trading rules — OPTIONS FLOW (high weight — smart money signals):
+- P/C ratio < 0.7: heavy put buying — bearish signal, reduce buy confidence or lean sell
+- P/C ratio > 1.5: heavy call buying — bullish signal, increase buy confidence
+- Institutional flow detected (conf >= 55%): smart money is positioning — strong bullish signal, boost confidence significantly
+- Retail-only flow: less conviction, standard weight
+- Institutional buying + bullish P/C + good technicals = very high confidence BUY
+
+Trading rules — ANALYST & FUNDAMENTALS:
+- Analyst upside > 30%: Wall Street sees significant value, lean bullish
+- Analyst upside < -10%: overvalued vs targets, reduce buy confidence
+- 52-week position < 20%: near lows — opportunity zone, lean bullish
+- 52-week position > 80%: extended — be cautious on new buys
+- PEG < 1.0: undervalued relative to growth — bullish fundamental signal
+- Strong revenue growth (>20%) supports bullish thesis
 
 You must respond with ONLY a JSON object (no markdown, no other text):
 {
@@ -166,7 +303,7 @@ You must respond with ONLY a JSON object (no markdown, no other text):
 }"""
 
     def _build_prompt(self, symbol, technical_data, market_context, current_position,
-                      earnings_ctx=None):
+                      earnings_ctx=None, enhanced_ctx=None):
         has_position = current_position is not None
         if has_position:
             task = f"Analyze {symbol} and decide: SELL our position or HOLD it."
@@ -243,6 +380,42 @@ P&L: ${pl:.2f} ({plpc*100:.1f}%)
                     prompt += f"Beat Streak: {streak} consecutive beats\n"
                 elif streak <= -2:
                     prompt += f"Miss Streak: {abs(streak)} consecutive misses — caution\n"
+
+        # ── Analyst targets + fundamentals ───────────────────────────────
+        if enhanced_ctx:
+            prompt += "\nANALYST & FUNDAMENTALS:\n"
+            if 'analyst_upside' in enhanced_ctx:
+                upside = enhanced_ctx['analyst_upside']
+                target = enhanced_ctx.get('analyst_target', '')
+                count  = enhanced_ctx.get('analyst_count', '')
+                tag    = ' 🎯 STRONG UPSIDE' if upside > 30 else (' ⚠️ OVERVALUED' if upside < -10 else '')
+                prompt += f"Analyst Target: ${target} ({upside:+.1f}% upside, {count} analysts){tag}\n"
+            if 'pos52' in enhanced_ctx:
+                pos = enhanced_ctx['pos52']
+                tag = ' 🟢 Near 52W low — opportunity' if pos < 20 else (' 🔴 Near 52W high — extended' if pos > 80 else '')
+                prompt += f"52-Week Position: {pos:.0f}% from low (low=${enhanced_ctx.get('week52l','')}, high=${enhanced_ctx.get('week52h','')}){tag}\n"
+            parts = []
+            if 'forward_pe' in enhanced_ctx: parts.append(f"Fwd P/E: {enhanced_ctx['forward_pe']}")
+            if 'peg'        in enhanced_ctx: parts.append(f"PEG: {enhanced_ctx['peg']}" + (' 🟢 cheap' if enhanced_ctx['peg'] < 1.0 else ''))
+            if 'rev_growth' in enhanced_ctx: parts.append(f"Rev Growth: {enhanced_ctx['rev_growth']:+.1f}%")
+            if 'op_margins' in enhanced_ctx: parts.append(f"Op Margin: {enhanced_ctx['op_margins']:.1f}%")
+            if parts:
+                prompt += "Fundamentals: " + " | ".join(parts) + "\n"
+
+            # ── Options flow ─────────────────────────────────────────────
+            if 'pc_ratio' in enhanced_ctx:
+                prompt += "\nOPTIONS FLOW:\n"
+                pc   = enhanced_ctx['pc_ratio']
+                cvol = enhanced_ctx.get('call_vol', 0)
+                pvol = enhanced_ctx.get('put_vol', 0)
+                sent = enhanced_ctx.get('options_sentiment', '')
+                prompt += f"P/C Ratio: {pc:.2f} (calls {cvol:,} vs puts {pvol:,}) — {sent}\n"
+                if 'inst_conf' in enhanced_ctx:
+                    conf  = enhanced_ctx['inst_conf']
+                    buyer = enhanced_ctx['inst_buyer']
+                    tag   = ' 🏛 Smart money loading up — strong bullish signal' if buyer == 'Institutional' else \
+                            ' 👤 Retail-driven flow — less conviction' if buyer == 'Retail' else ''
+                    prompt += f"Institutional Flow: {conf}% confidence → {buyer} buying{tag}\n"
 
         prompt += f"""
 TRADING PARAMETERS:
