@@ -201,7 +201,7 @@ def scan_news():
             items = root.findall(".//item")
             print(f"  News [{query[:38]:38s}]: {len(items)} articles")
 
-            for item in items[:6]:
+            for item in items[:20]:
                 title = item.findtext("title", "") or ""
                 desc  = item.findtext("description", "") or ""
                 link  = item.findtext("link", "") or ""
@@ -226,9 +226,12 @@ def scan_news():
                 m = ticker_re.search(title) or dollar_re.search(title)
                 ticker = m.group(1) if m else ""
 
-                # Parse date
+                # Parse date — skip articles older than 48 hours
                 try:
                     dt  = datetime.strptime(pub[:25], "%a, %d %b %Y %H:%M:%S")
+                    age = (datetime.utcnow() - dt).total_seconds() / 3600
+                    if age > 48:
+                        continue
                     day = dt.strftime("%b %d")
                 except:
                     day = pub[:10]
